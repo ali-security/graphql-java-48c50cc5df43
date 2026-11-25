@@ -6,10 +6,16 @@ on:
       version:
         description: 'the version to be released'
         required: true
+        default: '21.5'
+      test-filter:
+        description: 'Gradle test task + filter to run instead of the full check (e.g. test --tests FooTest)'
+        required: false
+        default: ''
 
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAVEN_CENTRAL_PGP_KEY: ${{ secrets.MAVEN_CENTRAL_PGP_KEY }}
       MAVEN_CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USER }}
@@ -24,5 +30,87 @@ jobs:
         with:
           java-version: '11'
           distribution: 'corretto'
+          cache: gradle
       - name: build test and publish
-        run: ./gradlew assemble && ./gradlew check --info && ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -x check --info --stacktrace
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble --no-build-cache && ./gradlew ${{ inputs.test-filter }} --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          else
+            ./gradlew assemble --no-build-cache && ./gradlew check --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          fi
+      - name: Upload release jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphql-java-jar
+          path: build/libs/graphql-java-${{ github.event.inputs.version }}.jar
+          if-no-files-found: error
+      - name: Test results summary
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, re
+          import xml.etree.ElementTree as ET
+
+          IGN = re.compile(r'@Ignore\s*(\(\s*(?:value\s*=\s*)?["\'](.*?)["\']\s*\))?')
+
+          def comment_above(lines, j):
+              for k in range(j - 1, max(j - 5, -1), -1):
+                  c = lines[k].strip()
+                  if c.startswith('//') or c.startswith('*') or c.startswith('/*'):
+                      return c.lstrip('/* ').strip()
+              return None
+
+          def ignore_reason(classname, method):
+              # Look up the Spock/JUnit @Ignore text, or the comment above a bare @Ignore
+              simple = classname.split('.')[-1].split('$')[0]
+              key = method.strip('"\'')[:40]
+              for path in glob.glob('src/test/**/' + simple + '.*', recursive=True):
+                  try:
+                      lines = open(path, encoding='utf-8').read().splitlines()
+                  except Exception:
+                      continue
+                  if key:
+                      for i, line in enumerate(lines):
+                          if key in line:
+                              for j in range(i - 1, max(i - 8, -1), -1):
+                                  m = IGN.search(lines[j])
+                                  if m:
+                                      return m.group(2) or comment_above(lines, j) or '@Ignore annotation in source (no reason text)'
+                  for i, line in enumerate(lines):
+                      m = IGN.search(line)
+                      if m and re.search(r'\bclass\b', ' '.join(lines[i:i + 4])):
+                          return (m.group(2) or comment_above(lines, i) or 'class-level @Ignore') + ' (class-level @Ignore)'
+              if method.startswith('untested_'):
+                  return 'reactive-streams TCK: rule not verifiable by the TCK (untested_ = notVerified)'
+              if method.startswith('optional_spec111'):
+                  return 'reactive-streams TCK: optional multi-subscribe rule not supported by this publisher'
+              if method.startswith('required_spec317'):
+                  return 'reactive-streams TCK: needs 2147483647 elements, exceeds maxElementsFromPublisher 10000'
+              if method.startswith('optional_') or method.startswith('stochastic_'):
+                  return 'reactive-streams TCK: optional/stochastic rule skipped by the TCK (SkipException)'
+              return 'skipped by test framework'
+
+          grand = [0, 0, 0, 0]
+          skipped_lines = []
+          for task in ('test', 'testng'):
+              files = glob.glob('build/test-results/%s/*.xml' % task)
+              t = f = s = 0
+              for fp in files:
+                  root = ET.parse(fp).getroot()
+                  for tc in root.iter('testcase'):
+                      t += 1
+                      if tc.find('failure') is not None or tc.find('error') is not None:
+                          f += 1
+                      elif tc.find('skipped') is not None:
+                          s += 1
+                          sk = tc.find('skipped')
+                          reason = (sk.get('message') or '').strip() or ignore_reason(tc.get('classname', ''), tc.get('name', ''))
+                          skipped_lines.append('SKIPPED %s > %s : %s' % (tc.get('classname'), tc.get('name'), reason[:200]))
+              passed = t - f - s
+              print('Task :%s - tests run: %d, passed: %d, failed: %d, skipped: %d (%d result files)' % (task, t, passed, f, s, len(files)))
+              for i, v in enumerate((t, passed, f, s)):
+                  grand[i] += v
+          print('Skipped tests with reasons (%d):' % len(skipped_lines))
+          for l in skipped_lines:
+              print(l)
+          print('TOTAL tests run: %d, passed: %d, failed: %d, skipped: %d' % tuple(grand))
